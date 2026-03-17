@@ -1,0 +1,3 @@
+[submodule "extern/TinyEKF"]
+	path = third_party/TinyEKF
+	url = https://github.com/simondlevy/TinyEKF
