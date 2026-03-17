@@ -1,6 +1,6 @@
 # ABS
 
-[![Build](https://github.com/Mrchazaaa/ABS/actions/workflows/build.yml/badge.svg)](https://github.com/Mrchazaaa/ABS/actions/workflows/build.yml)
+[![Build](https://github.com/Mrchazaaa/ABS/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/Mrchazaaa/ABS/actions/workflows/build.yml)
 
 Standalone ABS controller library extracted from the Charlie Robot Speed Dreams driver.
 
