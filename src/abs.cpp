@@ -1,14 +1,14 @@
 #include "ABS/abs.h"
 
 #include <cmath>
-#include <cstdio>
-#include <cstring>
 
 #include "velocity_ekf.h"
 
 namespace {
 
-constexpr int kPhaseOff = 0;
+constexpr float kMinMagnitude = 1e-6f;
+constexpr float kInactiveTimer = -1.0f;
+constexpr float kAggressiveRecoveryFactor = 10.0f;
 
 const AbsConfig kConfig = {
     10.0f,
@@ -25,136 +25,276 @@ const AbsConfig kConfig = {
     0.3179f,
 };
 
+enum class Phase : int {
+  kOff = 0,
+  kBuildPressure = 1,
+  kMonitorSlip = 2,
+  kReleasePressure = 3,
+  kHoldAfterRelease = 4,
+  kPrimaryReapply = 5,
+  kHoldAfterPrimaryReapply = 6,
+  kSecondaryReapply = 7,
+};
+
+struct WheelState {
+  Phase phase = Phase::kOff;
+  float timer = kInactiveTimer;
+  float spin_velocity = 0.0f;
+  float spin_acceleration = 0.0f;
+  float slip_acceleration = 0.0f;
+  float slip = 0.0f;
+  float max_slip = kConfig.initial_max_wheel_slip;
+  float brake_command = 0.0f;
+};
+
+struct ControllerRuntime {
+  float last_timestamp = 0.0f;
+  float delta_time = 0.0f;
+  float vehicle_speed = 0.0f;
+  bool ekf_active = false;
+};
+
 static float clamp_nonzero(float value)
 {
-  if (std::fabs(value) >= 1e-6f) {
+  if (std::fabs(value) >= kMinMagnitude) {
     return value;
   }
-  return value < 0.0f ? -1e-6f : 1e-6f;
+  return value < 0.0f ? -kMinMagnitude : kMinMagnitude;
+}
+
+static float pressure_to_command(float delta_time, float pressure_rate)
+{
+  return (delta_time * pressure_rate) / kConfig.max_brake_pressure;
+}
+
+static bool update_delay_timer(float *timer, float delta_time)
+{
+  if (*timer < 0.0f) {
+    *timer = kConfig.apply_delay;
+  } else {
+    *timer -= delta_time;
+  }
+
+  return *timer < 0.0f;
+}
+
+static float compute_average_front_wheel_speed(const AbsStepInput &input)
+{
+  return (input.wheel_spin_velocity[ABS_FL] + input.wheel_spin_velocity[ABS_FR]) / 2.0f;
+}
+
+static float compute_average_rear_wheel_speed(const AbsStepInput &input)
+{
+  return (input.wheel_spin_velocity[ABS_RL] + input.wheel_spin_velocity[ABS_RR]) / 2.0f;
+}
+
+static void reset_wheel_state(WheelState *wheel)
+{
+  wheel->phase = Phase::kOff;
+  wheel->timer = kInactiveTimer;
+  wheel->spin_velocity = 0.0f;
+  wheel->spin_acceleration = 0.0f;
+  wheel->slip_acceleration = 0.0f;
+  wheel->slip = 0.0f;
+  wheel->max_slip = kConfig.initial_max_wheel_slip;
+  wheel->brake_command = 0.0f;
+}
+
+static void deactivate_wheel(WheelState *wheel, float requested_pressure, bool passthrough_brake)
+{
+  wheel->phase = Phase::kOff;
+  wheel->timer = kInactiveTimer;
+  wheel->max_slip = kConfig.initial_max_wheel_slip;
+  if (passthrough_brake) {
+    wheel->brake_command = requested_pressure;
+  }
+}
+
+static void update_phase(
+    WheelState *wheel,
+    float delta_time,
+    float requested_pressure)
+{
+  switch (wheel->phase) {
+    case Phase::kOff:
+      wheel->phase = Phase::kBuildPressure;
+      break;
+    case Phase::kBuildPressure:
+      wheel->brake_command = requested_pressure;
+      if (wheel->spin_acceleration < kConfig.min_wheel_spin_acceleration) {
+        wheel->phase = Phase::kMonitorSlip;
+      }
+      break;
+    case Phase::kMonitorSlip:
+      if (wheel->slip > wheel->max_slip) {
+        wheel->max_slip = wheel->slip;
+        wheel->phase = Phase::kReleasePressure;
+      }
+      break;
+    case Phase::kReleasePressure:
+      wheel->brake_command -= pressure_to_command(delta_time, kConfig.release_rate);
+      if (wheel->spin_acceleration > kConfig.max_wheel_spin_acceleration) {
+        wheel->phase = Phase::kHoldAfterRelease;
+      }
+      break;
+    case Phase::kHoldAfterRelease:
+      if (update_delay_timer(&wheel->timer, delta_time) ||
+          wheel->spin_acceleration >
+              (kConfig.max_wheel_spin_acceleration * kAggressiveRecoveryFactor)) {
+        wheel->timer = kInactiveTimer;
+        wheel->phase = Phase::kPrimaryReapply;
+      }
+      break;
+    case Phase::kPrimaryReapply:
+      wheel->brake_command += pressure_to_command(delta_time, kConfig.primary_apply_rate);
+      if (wheel->spin_acceleration < 0.0f) {
+        wheel->phase = Phase::kHoldAfterPrimaryReapply;
+      }
+      break;
+    case Phase::kHoldAfterPrimaryReapply:
+      if (update_delay_timer(&wheel->timer, delta_time) ||
+          wheel->spin_acceleration < kConfig.min_wheel_spin_acceleration) {
+        wheel->timer = kInactiveTimer;
+        wheel->phase = Phase::kSecondaryReapply;
+      }
+      break;
+    case Phase::kSecondaryReapply:
+      if (wheel->brake_command >= 1.0f) {
+        wheel->brake_command = 1.0f;
+      } else {
+        wheel->brake_command += pressure_to_command(delta_time, kConfig.secondary_apply_rate);
+      }
+      if (wheel->spin_acceleration < kConfig.min_wheel_spin_acceleration) {
+        wheel->phase = Phase::kReleasePressure;
+      }
+      break;
+  }
 }
 
 }  // namespace
 
 struct AbsController {
-  float timers[ABS_WHEEL_COUNT];
-  int phase_states[ABS_WHEEL_COUNT];
-  float wheel_spin_velocity[ABS_WHEEL_COUNT];
-  float wheel_spin_acceleration[ABS_WHEEL_COUNT];
-  float wheel_slip_acceleration[ABS_WHEEL_COUNT];
-  float wheel_slip[ABS_WHEEL_COUNT];
-  float max_wheel_slip[ABS_WHEEL_COUNT];
-  float brake_command[ABS_WHEEL_COUNT];
-  float last_timestamp;
-  float delta_time;
-  float vehicle_speed;
-  int ekf_is_active;
+  WheelState wheels[ABS_WHEEL_COUNT];
+  ControllerRuntime runtime;
+  VelocityEkf ekf;
 };
 
 static void reset_runtime_state(AbsController *controller)
 {
   for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-    controller->timers[i] = -1.0f;
-    controller->phase_states[i] = kPhaseOff;
-    controller->wheel_spin_velocity[i] = 0.0f;
-    controller->wheel_spin_acceleration[i] = 0.0f;
-    controller->wheel_slip_acceleration[i] = 0.0f;
-    controller->wheel_slip[i] = 0.0f;
-    controller->max_wheel_slip[i] = kConfig.initial_max_wheel_slip;
-    controller->brake_command[i] = 0.0f;
+    reset_wheel_state(&controller->wheels[i]);
   }
-  controller->last_timestamp = 0.0f;
-  controller->delta_time = 0.0f;
-  controller->vehicle_speed = 0.0f;
-  controller->ekf_is_active = 0;
+  controller->runtime = {};
+  velocity_ekf_reset(&controller->ekf, 0.0);
 }
 
-static void apply_phase(
-    AbsController *controller,
-    int wheel,
-    float input_pressure)
+static void update_timestep(AbsController *controller, float timestamp)
 {
-  switch (controller->phase_states[wheel]) {
-    case kPhaseOff:
-      controller->phase_states[wheel] = 1;
-      break;
-    case 1:
-      controller->brake_command[wheel] = input_pressure;
-      if (kConfig.min_wheel_spin_acceleration >
-          controller->wheel_spin_acceleration[wheel]) {
-        controller->phase_states[wheel] = 2;
-      }
-      break;
-    case 2:
-      if (controller->wheel_slip[wheel] > controller->max_wheel_slip[wheel]) {
-        controller->max_wheel_slip[wheel] = controller->wheel_slip[wheel];
-        controller->phase_states[wheel] = 3;
-      }
-      break;
-    case 3: {
-      const float pressure_to_release = controller->delta_time * kConfig.release_rate;
-      const float cmd_release_pressure = pressure_to_release / kConfig.max_brake_pressure;
-      controller->brake_command[wheel] -= cmd_release_pressure;
-      if (controller->wheel_spin_acceleration[wheel] >
-          kConfig.max_wheel_spin_acceleration) {
-        controller->phase_states[wheel] = 4;
-      }
-      break;
-    }
-    case 4:
-      if (controller->timers[wheel] < 0.0f) {
-        controller->timers[wheel] = kConfig.apply_delay;
-      } else {
-        controller->timers[wheel] -= controller->delta_time;
-      }
-      if (controller->timers[wheel] < 0.0f ||
-          (kConfig.max_wheel_spin_acceleration * 10.0f) <
-              controller->wheel_spin_acceleration[wheel]) {
-        controller->timers[wheel] = -1.0f;
-        controller->phase_states[wheel] = 5;
-      }
-      break;
-    case 5: {
-      const float pressure_to_apply =
-          controller->delta_time * kConfig.primary_apply_rate;
-      const float cmd_apply_pressure = pressure_to_apply / kConfig.max_brake_pressure;
-      controller->brake_command[wheel] += cmd_apply_pressure;
-      if (controller->wheel_spin_acceleration[wheel] < 0.0f) {
-        controller->phase_states[wheel] = 6;
-      }
-      break;
-    }
-    case 6:
-      if (controller->timers[wheel] < 0.0f) {
-        controller->timers[wheel] = kConfig.apply_delay;
-      } else {
-        controller->timers[wheel] -= controller->delta_time;
-      }
-      if (controller->timers[wheel] < 0.0f ||
-          kConfig.min_wheel_spin_acceleration >
-              controller->wheel_spin_acceleration[wheel]) {
-        controller->timers[wheel] = -1.0f;
-        controller->phase_states[wheel] = 7;
-      }
-      break;
-    case 7: {
-      const float pressure_to_apply =
-          controller->delta_time * kConfig.secondary_apply_rate;
-      const float cmd_apply_pressure = pressure_to_apply / kConfig.max_brake_pressure;
-      if (controller->brake_command[wheel] >= 1.0f) {
-        controller->brake_command[wheel] = 1.0f;
-      } else {
-        controller->brake_command[wheel] += cmd_apply_pressure;
-      }
-      if (kConfig.min_wheel_spin_acceleration >
-          controller->wheel_spin_acceleration[wheel]) {
-        controller->phase_states[wheel] = 3;
-      }
-      break;
-    }
-    default:
-      std::printf("ABS state error\n");
-      break;
+  if (controller->runtime.last_timestamp == 0.0f) {
+    controller->runtime.ekf_active = false;
+    controller->runtime.last_timestamp = timestamp;
   }
+
+  controller->runtime.delta_time = timestamp - controller->runtime.last_timestamp;
+  if (controller->runtime.delta_time <= 0.0f) {
+    controller->runtime.delta_time = kMinMagnitude;
+  }
+}
+
+static void update_wheel_kinematics(
+    AbsController *controller,
+    const AbsStepInput *input)
+{
+  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
+    WheelState &wheel = controller->wheels[i];
+    wheel.spin_acceleration =
+        (input->wheel_spin_velocity[i] - wheel.spin_velocity) /
+        controller->runtime.delta_time;
+    wheel.spin_velocity = input->wheel_spin_velocity[i];
+  }
+}
+
+static void update_vehicle_speed(
+    AbsController *controller,
+    const AbsStepInput *input)
+{
+  if (!controller->runtime.ekf_active) {
+    controller->runtime.vehicle_speed =
+        compute_average_front_wheel_speed(*input) * kConfig.wheel_radius_static;
+    return;
+  }
+
+  controller->runtime.vehicle_speed = static_cast<float>(velocity_ekf_step(
+      &controller->ekf,
+      0.0,
+      compute_average_front_wheel_speed(*input),
+      compute_average_rear_wheel_speed(*input)));
+}
+
+static void update_wheel_slip(AbsController *controller)
+{
+  const float safe_vehicle_speed = clamp_nonzero(controller->runtime.vehicle_speed);
+  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
+    WheelState &wheel = controller->wheels[i];
+    const float next_slip =
+        (controller->runtime.vehicle_speed -
+         wheel.spin_velocity * kConfig.wheel_radius_static) /
+        safe_vehicle_speed;
+    wheel.slip_acceleration =
+        (next_slip - wheel.slip) / controller->runtime.delta_time;
+    wheel.slip = next_slip;
+  }
+}
+
+static bool abs_control_enabled(const AbsController *controller, const AbsStepInput *input)
+{
+  return controller->runtime.vehicle_speed > kConfig.min_vehicle_velocity_threshold &&
+         input->requested_pressure >
+             (kConfig.min_pressure_threshold / kConfig.max_brake_pressure);
+}
+
+static bool wheel_is_eligible(const WheelState &wheel)
+{
+  return wheel.spin_velocity * kConfig.wheel_radius_static >
+         kConfig.min_wheel_velocity_threshold;
+}
+
+static void update_wheel_controller(
+    AbsController *controller,
+    int wheel_index,
+    float requested_pressure)
+{
+  WheelState &wheel = controller->wheels[wheel_index];
+  update_phase(&wheel, controller->runtime.delta_time, requested_pressure);
+
+  if (!controller->runtime.ekf_active) {
+    velocity_ekf_reset(&controller->ekf, controller->runtime.vehicle_speed);
+    controller->runtime.ekf_active = true;
+  }
+}
+
+static void run_abs_control(
+    AbsController *controller,
+    const AbsStepInput *input)
+{
+  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
+    WheelState &wheel = controller->wheels[i];
+    if (wheel_is_eligible(wheel)) {
+      update_wheel_controller(controller, i, input->requested_pressure);
+    } else {
+      deactivate_wheel(&wheel, input->requested_pressure, false);
+    }
+  }
+}
+
+static void run_passthrough_braking(
+    AbsController *controller,
+    const AbsStepInput *input)
+{
+  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
+    deactivate_wheel(&controller->wheels[i], input->requested_pressure, true);
+  }
+  controller->runtime.last_timestamp = 0.0f;
 }
 
 static void copy_debug_state(
@@ -162,18 +302,17 @@ static void copy_debug_state(
     AbsStepOutput *output)
 {
   for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-    output->brake_command[i] = controller->brake_command[i];
-    output->debug.phase_states[i] = controller->phase_states[i];
-    output->debug.wheel_spin_velocity[i] = controller->wheel_spin_velocity[i];
-    output->debug.wheel_spin_acceleration[i] =
-        controller->wheel_spin_acceleration[i];
-    output->debug.wheel_slip_acceleration[i] =
-        controller->wheel_slip_acceleration[i];
-    output->debug.wheel_slip[i] = controller->wheel_slip[i];
-    output->debug.max_wheel_slip[i] = controller->max_wheel_slip[i];
+    const WheelState &wheel = controller->wheels[i];
+    output->brake_command[i] = wheel.brake_command;
+    output->debug.phase_states[i] = static_cast<int>(wheel.phase);
+    output->debug.wheel_spin_velocity[i] = wheel.spin_velocity;
+    output->debug.wheel_spin_acceleration[i] = wheel.spin_acceleration;
+    output->debug.wheel_slip_acceleration[i] = wheel.slip_acceleration;
+    output->debug.wheel_slip[i] = wheel.slip;
+    output->debug.max_wheel_slip[i] = wheel.max_slip;
   }
-  output->debug.delta_time = controller->delta_time;
-  output->debug.vehicle_speed = controller->vehicle_speed;
+  output->debug.delta_time = controller->runtime.delta_time;
+  output->debug.vehicle_speed = controller->runtime.vehicle_speed;
 }
 
 const AbsConfig *abs_get_config(void)
@@ -210,74 +349,16 @@ void abs_step(
     return;
   }
 
-  if (controller->last_timestamp == 0.0f) {
-    controller->ekf_is_active = 0;
-    controller->last_timestamp = input->timestamp;
-  }
+  update_timestep(controller, input->timestamp);
+  update_wheel_kinematics(controller, input);
+  update_vehicle_speed(controller, input);
+  update_wheel_slip(controller);
+  controller->runtime.last_timestamp = input->timestamp;
 
-  controller->delta_time = input->timestamp - controller->last_timestamp;
-  if (controller->delta_time <= 0.0f) {
-    controller->delta_time = 1e-6f;
-  }
-
-  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-    controller->wheel_spin_acceleration[i] =
-        (input->wheel_spin_velocity[i] - controller->wheel_spin_velocity[i]) /
-        controller->delta_time;
-    controller->wheel_spin_velocity[i] = input->wheel_spin_velocity[i];
-  }
-
-  if (controller->ekf_is_active == 0) {
-    controller->vehicle_speed =
-        ((input->wheel_spin_velocity[ABS_FL] * kConfig.wheel_radius_static) +
-         (input->wheel_spin_velocity[ABS_FR] * kConfig.wheel_radius_static)) / 2.0f;
+  if (abs_control_enabled(controller, input)) {
+    run_abs_control(controller, input);
   } else {
-    const double front_angular_speed =
-        (input->wheel_spin_velocity[ABS_FL] +
-         input->wheel_spin_velocity[ABS_FR]) / 2.0;
-    const double rear_angular_speed =
-        (input->wheel_spin_velocity[ABS_RL] +
-         input->wheel_spin_velocity[ABS_RR]) / 2.0;
-    controller->vehicle_speed = static_cast<float>(
-        abs_step_ekf(0.0, front_angular_speed, rear_angular_speed));
-  }
-
-  const float safe_vehicle_speed = clamp_nonzero(controller->vehicle_speed);
-  for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-    const float next_slip =
-        (controller->vehicle_speed -
-         controller->wheel_spin_velocity[i] * kConfig.wheel_radius_static) /
-        safe_vehicle_speed;
-    controller->wheel_slip_acceleration[i] =
-        (next_slip - controller->wheel_slip[i]) / controller->delta_time;
-    controller->wheel_slip[i] = next_slip;
-  }
-
-  controller->last_timestamp = input->timestamp;
-
-  if (controller->vehicle_speed > kConfig.min_vehicle_velocity_threshold &&
-      input->requested_pressure >
-          (kConfig.min_pressure_threshold / kConfig.max_brake_pressure)) {
-    for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-      if (controller->wheel_spin_velocity[i] * kConfig.wheel_radius_static >
-          kConfig.min_wheel_velocity_threshold) {
-        apply_phase(controller, i, input->requested_pressure);
-        if (controller->ekf_is_active == 0) {
-          abs_start_ekf(controller->vehicle_speed);
-          controller->ekf_is_active = 1;
-        }
-      } else {
-        controller->phase_states[i] = kPhaseOff;
-        controller->max_wheel_slip[i] = kConfig.initial_max_wheel_slip;
-      }
-    }
-  } else {
-    for (int i = 0; i < ABS_WHEEL_COUNT; ++i) {
-      controller->phase_states[i] = kPhaseOff;
-      controller->max_wheel_slip[i] = kConfig.initial_max_wheel_slip;
-      controller->brake_command[i] = input->requested_pressure;
-    }
-    controller->last_timestamp = 0.0f;
+    run_passthrough_braking(controller, input);
   }
 
   copy_debug_state(controller, output);
